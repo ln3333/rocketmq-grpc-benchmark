@@ -39,7 +39,7 @@ final class Metrics implements Closeable {
             if (parent != null) Files.createDirectories(parent);
             this.csv = Files.newBufferedWriter(path, StandardCharsets.UTF_8,
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
-            csv.write("timestamp,phase,scope,elapsed_seconds,attempts,success,failures,tps,mbps,"
+            csv.write("timestamp,phase,scope,elapsed_seconds,attempts,success,failures,duplicates,tps,mbps,"
                 + "lat_avg_ms,lat_p50_ms,lat_p95_ms,lat_p99_ms,lat_max_ms,"
                 + "e2e_p50_ms,e2e_p95_ms,e2e_p99_ms,delivery_lag_p50_ms,delivery_lag_p95_ms,"
                 + "delivery_lag_p99_ms,clock_skew_samples\n");
@@ -60,13 +60,17 @@ final class Metrics implements Closeable {
     }
 
     void success(int bytes, long operationNanos, Long e2eMillis, Long deliveryLagMillis) {
-        interval.record(true, bytes, operationNanos, e2eMillis, deliveryLagMillis);
-        if (measuring) total.record(true, bytes, operationNanos, e2eMillis, deliveryLagMillis);
+        success(bytes, operationNanos, e2eMillis, deliveryLagMillis, false);
+    }
+
+    void success(int bytes, long operationNanos, Long e2eMillis, Long deliveryLagMillis, boolean duplicate) {
+        interval.record(true, bytes, operationNanos, e2eMillis, deliveryLagMillis, duplicate);
+        if (measuring) total.record(true, bytes, operationNanos, e2eMillis, deliveryLagMillis, duplicate);
     }
 
     void failure(long operationNanos) {
-        interval.record(false, 0, operationNanos, null, null);
-        if (measuring) total.record(false, 0, operationNanos, null, null);
+        interval.record(false, 0, operationNanos, null, null, false);
+        if (measuring) total.record(false, 0, operationNanos, null, null, false);
     }
 
     private synchronized void reportInterval() throws IOException {
@@ -99,9 +103,10 @@ final class Metrics implements Closeable {
         double tps = seconds == 0 ? 0 : s.success / seconds;
         double mbps = seconds == 0 ? 0 : s.bytes / 1024d / 1024d / seconds;
         StringBuilder line = new StringBuilder(String.format(Locale.ROOT,
-            "%s %-7s %-15s attempts=%d success=%d fail=%d tps=%.2f MB/s=%.2f "
+            "%s %-7s %-15s attempts=%d success=%d fail=%d dup=%d unique=%d tps=%.2f MB/s=%.2f "
                 + "lat(ms)=avg:%.3f,p50:%.3f,p95:%.3f,p99:%.3f,max:%.3f",
-            Instant.now(), phase, scope, s.attempts, s.success, s.failures, tps, mbps,
+            Instant.now(), phase, scope, s.attempts, s.success, s.failures, s.duplicates,
+            Math.max(0, s.success - s.duplicates), tps, mbps,
             millis(s.latency.averageMicros()), millis(s.latency.percentileMicros(50)),
             millis(s.latency.percentileMicros(95)), millis(s.latency.percentileMicros(99)),
             s.latency.maxNanos / 1_000_000d));
@@ -124,9 +129,9 @@ final class Metrics implements Closeable {
         double tps = seconds == 0 ? 0 : s.success / seconds;
         double mbps = seconds == 0 ? 0 : s.bytes / 1024d / 1024d / seconds;
         csv.write(String.format(Locale.ROOT,
-            "%s,%s,%s,%.3f,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
+            "%s,%s,%s,%.3f,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
                 + "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d%n",
-            Instant.now(), phase, scope, seconds, s.attempts, s.success, s.failures, tps, mbps,
+            Instant.now(), phase, scope, seconds, s.attempts, s.success, s.failures, s.duplicates, tps, mbps,
             millis(s.latency.averageMicros()), millis(s.latency.percentileMicros(50)),
             millis(s.latency.percentileMicros(95)), millis(s.latency.percentileMicros(99)),
             s.latency.maxNanos / 1_000_000d,
@@ -227,6 +232,7 @@ final class Metrics implements Closeable {
         private final LongAdder attempts = new LongAdder();
         private final LongAdder success = new LongAdder();
         private final LongAdder failures = new LongAdder();
+        private final LongAdder duplicates = new LongAdder();
         private final LongAdder bytes = new LongAdder();
         private final LongAdder clockSkew = new LongAdder();
         private final Histogram latency = new Histogram();
@@ -234,9 +240,11 @@ final class Metrics implements Closeable {
         private final Histogram deliveryLag = new Histogram();
         private final AtomicLong lastSnapshot = new AtomicLong(System.nanoTime());
 
-        void record(boolean succeeded, int byteCount, long operationNanos, Long e2eMillis, Long lagMillis) {
+        void record(boolean succeeded, int byteCount, long operationNanos, Long e2eMillis, Long lagMillis,
+            boolean duplicate) {
             attempts.increment();
             if (succeeded) success.increment(); else failures.increment();
+            if (succeeded && duplicate) duplicates.increment();
             bytes.add(Math.max(0, byteCount));
             latency.recordNanos(operationNanos);
             if (e2eMillis != null) {
@@ -250,29 +258,32 @@ final class Metrics implements Closeable {
         Snapshot snapshotAndReset() {
             long now = System.nanoTime();
             return new Snapshot(attempts.sumThenReset(), success.sumThenReset(), failures.sumThenReset(),
-                bytes.sumThenReset(), clockSkew.sumThenReset(), latency.snapshot(true), e2e.snapshot(true),
-                deliveryLag.snapshot(true), now - lastSnapshot.getAndSet(now));
+                duplicates.sumThenReset(), bytes.sumThenReset(), clockSkew.sumThenReset(),
+                latency.snapshot(true), e2e.snapshot(true), deliveryLag.snapshot(true),
+                now - lastSnapshot.getAndSet(now));
         }
 
         Snapshot snapshot() {
-            return new Snapshot(attempts.sum(), success.sum(), failures.sum(), bytes.sum(), clockSkew.sum(),
-                latency.snapshot(false), e2e.snapshot(false), deliveryLag.snapshot(false), 0);
+            return new Snapshot(attempts.sum(), success.sum(), failures.sum(), duplicates.sum(), bytes.sum(),
+                clockSkew.sum(), latency.snapshot(false), e2e.snapshot(false), deliveryLag.snapshot(false), 0);
         }
 
         void reset() {
-            attempts.reset(); success.reset(); failures.reset(); bytes.reset(); clockSkew.reset();
-            latency.reset(); e2e.reset(); deliveryLag.reset(); lastSnapshot.set(System.nanoTime());
+            attempts.reset(); success.reset(); failures.reset(); duplicates.reset(); bytes.reset();
+            clockSkew.reset(); latency.reset(); e2e.reset(); deliveryLag.reset();
+            lastSnapshot.set(System.nanoTime());
         }
     }
 
     private static final class Snapshot {
-        final long attempts, success, failures, bytes, clockSkew, elapsedNanos;
+        final long attempts, success, failures, duplicates, bytes, clockSkew, elapsedNanos;
         final HistogramSnapshot latency, e2e, deliveryLag;
 
-        Snapshot(long attempts, long success, long failures, long bytes, long clockSkew,
+        Snapshot(long attempts, long success, long failures, long duplicates, long bytes, long clockSkew,
             HistogramSnapshot latency, HistogramSnapshot e2e, HistogramSnapshot deliveryLag, long elapsedNanos) {
-            this.attempts = attempts; this.success = success; this.failures = failures; this.bytes = bytes;
-            this.clockSkew = clockSkew; this.latency = latency; this.e2e = e2e; this.deliveryLag = deliveryLag;
+            this.attempts = attempts; this.success = success; this.failures = failures;
+            this.duplicates = duplicates; this.bytes = bytes; this.clockSkew = clockSkew;
+            this.latency = latency; this.e2e = e2e; this.deliveryLag = deliveryLag;
             this.elapsedNanos = elapsedNanos;
         }
     }

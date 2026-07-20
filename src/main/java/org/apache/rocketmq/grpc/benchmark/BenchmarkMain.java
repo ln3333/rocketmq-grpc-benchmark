@@ -5,7 +5,8 @@ import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.List;
-import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -18,7 +19,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 import org.apache.rocketmq.client.apis.ClientConfiguration;
 import org.apache.rocketmq.client.apis.ClientConfigurationBuilder;
-import org.apache.rocketmq.client.apis.ClientException;
 import org.apache.rocketmq.client.apis.ClientServiceProvider;
 import org.apache.rocketmq.client.apis.StaticSessionCredentialsProvider;
 import org.apache.rocketmq.client.apis.consumer.ConsumeResult;
@@ -32,6 +32,7 @@ import org.apache.rocketmq.client.apis.message.MessageBuilder;
 import org.apache.rocketmq.client.apis.message.MessageView;
 import org.apache.rocketmq.client.apis.producer.Producer;
 import org.apache.rocketmq.client.apis.producer.ProducerBuilder;
+import org.apache.rocketmq.client.apis.producer.SendReceipt;
 import org.apache.rocketmq.client.apis.producer.Transaction;
 import org.apache.rocketmq.client.apis.producer.TransactionResolution;
 
@@ -71,6 +72,7 @@ public final class BenchmarkMain {
         String topic = options.get("topic", null);
         String topicType = options.get("topic-type", "normal");
         boolean async = "async".equals(options.get("send-mode", "sync"));
+        boolean traceEnabled = options.bool("trace-enabled", true);
         int threads = options.integer("threads", 64);
         int maxInflight = options.integer("max-inflight", 1024);
         byte[] body = new byte[options.integer("message-size", 128)];
@@ -79,6 +81,7 @@ public final class BenchmarkMain {
         java.util.Arrays.fill(property, (byte) 'p');
         String propertyValue = new String(property, java.nio.charset.StandardCharsets.US_ASCII);
         AtomicLong sequence = new AtomicLong();
+        String instanceId = MessageTrace.newInstanceId();
         Pacer pacer = new Pacer(options.longValue("rate", 0));
         Semaphore inflight = new Semaphore(maxInflight);
 
@@ -94,9 +97,11 @@ public final class BenchmarkMain {
 
         ExecutorService workers = Executors.newFixedThreadPool(threads, new NamedFactory("producer"));
         try (Producer producer = builder.build();
-             Metrics metrics = metrics(options, "producer-" + topicType + (async ? "-async" : "-sync"))) {
-            System.out.printf("Producer started: topic=%s type=%s mode=%s threads=%d%n",
-                topic, topicType, async ? "async" : "sync", threads);
+             Metrics metrics = metrics(options, "producer-" + topicType + (async ? "-async" : "-sync"));
+             MessageJournal journal = journal(options, "producer", instanceId)) {
+            System.out.printf("Producer started: topic=%s type=%s mode=%s threads=%d trace=%s journal=%s%n",
+                topic, topicType, async ? "async" : "sync", threads, traceEnabled,
+                options.get("journal", null) == null ? "off" : options.get("journal", null));
             for (int i = 0; i < threads; i++) {
                 workers.execute(() -> {
                     while (lifecycle.running()) {
@@ -112,30 +117,39 @@ public final class BenchmarkMain {
                         }
                         long id = sequence.incrementAndGet();
                         long start = System.nanoTime();
+                        BuiltMessage built = message(provider, options, topicType, topic, body, propertyValue,
+                            id, instanceId, traceEnabled);
                         try {
-                            Message message = message(provider, options, topicType, topic, body, propertyValue, id);
                             if (async) {
-                                producer.sendAsync(message).whenComplete((receipt, error) -> {
+                                producer.sendAsync(built.message).whenComplete((receipt, error) -> {
                                     long latency = System.nanoTime() - start;
-                                    if (error == null) metrics.success(body.length, latency, null, null);
-                                    else metrics.failure(latency);
+                                    if (error == null) {
+                                        metrics.success(body.length, latency, null, null);
+                                        journalSent(journal, built, messageId(receipt), true);
+                                    } else {
+                                        metrics.failure(latency);
+                                        journalSent(journal, built, null, false);
+                                    }
                                     inflight.release();
                                 });
                             } else if ("tx".equals(topicType)) {
                                 Transaction transaction = producer.beginTransaction();
-                                producer.send(message, transaction);
-                                if ("ROLLBACK".equals(message.getProperties().get(TX_RESOLUTION_PROPERTY))) {
+                                SendReceipt receipt = producer.send(built.message, transaction);
+                                if ("ROLLBACK".equals(built.message.getProperties().get(TX_RESOLUTION_PROPERTY))) {
                                     transaction.rollback();
                                 } else {
                                     transaction.commit();
                                 }
                                 metrics.success(body.length, System.nanoTime() - start, null, null);
+                                journalSent(journal, built, messageId(receipt), true);
                             } else {
-                                producer.send(message);
+                                SendReceipt receipt = producer.send(built.message);
                                 metrics.success(body.length, System.nanoTime() - start, null, null);
+                                journalSent(journal, built, messageId(receipt), true);
                             }
                         } catch (Throwable t) {
                             metrics.failure(System.nanoTime() - start);
+                            journalSent(journal, built, null, false);
                             if (async) inflight.release();
                         }
                     }
@@ -146,6 +160,7 @@ public final class BenchmarkMain {
             if (async && !inflight.tryAcquire(maxInflight, SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
                 System.err.println("Timed out waiting for asynchronous sends to finish.");
             }
+            if (journal != null) journal.flush();
             metrics.reportFinal();
         } finally {
             lifecycle.stop();
@@ -153,12 +168,23 @@ public final class BenchmarkMain {
         }
     }
 
-    private static Message message(ClientServiceProvider provider, Options options, String topicType, String topic,
-        byte[] body, String propertyValue, long id) {
+    private static BuiltMessage message(ClientServiceProvider provider, Options options, String topicType,
+        String topic, byte[] body, String propertyValue, long id, String instanceId, boolean traceEnabled) {
         MessageBuilder builder = provider.newMessageBuilder().setTopic(topic).setBody(body);
         String tag = options.get("tag", "");
         if (!tag.isEmpty()) builder.setTag(tag);
-        if (options.bool("key-enabled", false)) builder.setKeys("benchmark-" + id);
+        String key = null;
+        long sendTs = -1L;
+        if (traceEnabled) {
+            key = MessageTrace.key(instanceId, id);
+            sendTs = System.currentTimeMillis();
+            builder.setKeys(key);
+            builder.addProperty(MessageTrace.SEQ_PROPERTY, Long.toString(id));
+            builder.addProperty(MessageTrace.SEND_TS_PROPERTY, Long.toString(sendTs));
+        } else if (options.bool("key-enabled", false)) {
+            key = MessageTrace.key(instanceId, id);
+            builder.setKeys(key);
+        }
         if (!propertyValue.isEmpty()) builder.addProperty("benchmarkProperty", propertyValue);
         if ("fifo".equals(topicType)) {
             builder.setMessageGroup("benchmark-group-" + (id % options.integer("message-groups", 64)));
@@ -168,7 +194,7 @@ public final class BenchmarkMain {
             boolean commit = ThreadLocalRandom.current().nextInt(100) < options.integer("commit-percent", 100);
             builder.addProperty(TX_RESOLUTION_PROPERTY, commit ? "COMMIT" : "ROLLBACK");
         }
-        return builder.build();
+        return new BuiltMessage(builder.build(), key, id, sendTs);
     }
 
     private static void runPushConsumer(Options options) throws Exception {
@@ -177,7 +203,10 @@ public final class BenchmarkMain {
         Pacer pacer = new Pacer(options.longValue("rate", 0));
         String topic = options.get("topic", null);
         int threads = options.integer("threads", 20);
-        try (Metrics metrics = metrics(options, "push-consumer")) {
+        String instanceId = MessageTrace.newInstanceId();
+        Set<String> seenKeys = ConcurrentHashMap.newKeySet();
+        try (Metrics metrics = metrics(options, "push-consumer");
+             MessageJournal journal = journal(options, "consumer", instanceId)) {
             PushConsumerBuilder builder = provider.newPushConsumerBuilder()
                 .setClientConfiguration(clientConfiguration(options))
                 .setConsumerGroup(options.get("consumer-group", null))
@@ -188,10 +217,20 @@ public final class BenchmarkMain {
                 .setEnableFifoConsumeAccelerator(options.bool("fifo-accelerator", false))
                 .setMessageListener(message -> {
                     long start = System.nanoTime();
+                    long recvTs = System.currentTimeMillis();
                     try {
                         pacer.acquire();
-                        MessageTimes times = messageTimes(message);
-                        metrics.success(bodySize(message), System.nanoTime() - start, times.e2eMillis, times.lagMillis);
+                        MessageTrace.TraceInfo trace = MessageTrace.inspect(message, seenKeys);
+                        if (journal != null) {
+                            journal.received(trace.key, trace.seq, trace.sendTs, trace.messageId, recvTs);
+                        }
+                        MessageTimes times = messageTimes(message, recvTs);
+                        long doneTs = System.currentTimeMillis();
+                        if (journal != null) {
+                            journal.done(trace.key, trace.seq, trace.sendTs, trace.messageId, doneTs, trace.duplicate);
+                        }
+                        metrics.success(bodySize(message), System.nanoTime() - start, times.e2eMillis,
+                            times.lagMillis, trace.duplicate);
                         return ConsumeResult.SUCCESS;
                     } catch (Throwable t) {
                         metrics.failure(System.nanoTime() - start);
@@ -199,9 +238,11 @@ public final class BenchmarkMain {
                     }
                 });
             try (PushConsumer ignored = builder.build()) {
-                System.out.printf("PushConsumer started: topic=%s group=%s threads=%d%n",
-                    topic, options.get("consumer-group", null), threads);
+                System.out.printf("PushConsumer started: topic=%s group=%s threads=%d journal=%s%n",
+                    topic, options.get("consumer-group", null), threads,
+                    options.get("journal", null) == null ? "off" : options.get("journal", null));
                 runPhases(options, lifecycle, metrics);
+                if (journal != null) journal.flush();
                 metrics.reportFinal();
             } finally {
                 lifecycle.stop();
@@ -215,6 +256,8 @@ public final class BenchmarkMain {
         String topic = options.get("topic", null);
         int threads = options.integer("threads", 4);
         Pacer pacer = new Pacer(options.longValue("rate", 0));
+        String instanceId = MessageTrace.newInstanceId();
+        Set<String> seenKeys = ConcurrentHashMap.newKeySet();
         ExecutorService workers = Executors.newFixedThreadPool(threads, new NamedFactory("simple-consumer"));
         try (SimpleConsumer consumer = provider.newSimpleConsumerBuilder()
                  .setClientConfiguration(clientConfiguration(options))
@@ -222,11 +265,13 @@ public final class BenchmarkMain {
                  .setAwaitDuration(Duration.ofMillis(options.longValue("await-ms", 30000)))
                  .setSubscriptionExpressions(Collections.singletonMap(topic, filter(options)))
                  .build();
-             Metrics metrics = metrics(options, "simple-consumer")) {
+             Metrics metrics = metrics(options, "simple-consumer");
+             MessageJournal journal = journal(options, "consumer", instanceId)) {
             int batchSize = options.integer("batch-size", 16);
             Duration invisible = Duration.ofMillis(options.longValue("invisible-ms", 15000));
-            System.out.printf("SimpleConsumer started: topic=%s group=%s threads=%d batch=%d%n",
-                topic, options.get("consumer-group", null), threads, batchSize);
+            System.out.printf("SimpleConsumer started: topic=%s group=%s threads=%d batch=%d journal=%s%n",
+                topic, options.get("consumer-group", null), threads, batchSize,
+                options.get("journal", null) == null ? "off" : options.get("journal", null));
             for (int i = 0; i < threads; i++) {
                 workers.execute(() -> {
                     while (lifecycle.running()) {
@@ -237,11 +282,21 @@ public final class BenchmarkMain {
                                 if (!lifecycle.running()) break;
                                 pacer.acquire();
                                 long start = System.nanoTime();
+                                long recvTs = System.currentTimeMillis();
+                                MessageTrace.TraceInfo trace = MessageTrace.inspect(message, seenKeys);
+                                if (journal != null) {
+                                    journal.received(trace.key, trace.seq, trace.sendTs, trace.messageId, recvTs);
+                                }
                                 try {
                                     consumer.ack(message);
-                                    MessageTimes times = messageTimes(message);
+                                    long doneTs = System.currentTimeMillis();
+                                    MessageTimes times = messageTimes(message, doneTs);
+                                    if (journal != null) {
+                                        journal.done(trace.key, trace.seq, trace.sendTs, trace.messageId, doneTs,
+                                            trace.duplicate);
+                                    }
                                     metrics.success(bodySize(message), System.nanoTime() - start,
-                                        times.e2eMillis, times.lagMillis);
+                                        times.e2eMillis, times.lagMillis, trace.duplicate);
                                 } catch (Throwable t) {
                                     metrics.failure(System.nanoTime() - start);
                                 }
@@ -254,6 +309,7 @@ public final class BenchmarkMain {
             }
             runPhases(options, lifecycle, metrics);
             stopWorkers(workers);
+            if (journal != null) journal.flush();
             metrics.reportFinal();
         } finally {
             lifecycle.stop();
@@ -287,6 +343,21 @@ public final class BenchmarkMain {
         return new Metrics(scope, options.integer("report-interval-seconds", 10), options.get("csv", null));
     }
 
+    private static MessageJournal journal(Options options, String role, String instanceId) throws IOException {
+        String path = options.get("journal", null);
+        if (path == null || path.isEmpty()) return null;
+        return new MessageJournal(path, role, instanceId);
+    }
+
+    private static void journalSent(MessageJournal journal, BuiltMessage built, String messageId, boolean ok) {
+        if (journal == null || built.key == null) return;
+        journal.sent(built.key, built.seq, built.sendTs, messageId, ok);
+    }
+
+    private static String messageId(SendReceipt receipt) {
+        return receipt == null || receipt.getMessageId() == null ? null : receipt.getMessageId().toString();
+    }
+
     private static void runPhases(Options options, Lifecycle lifecycle, Metrics metrics) throws InterruptedException {
         long warmup = options.longValue("warmup-seconds", 10);
         if (warmup > 0 && !lifecycle.await(warmup, TimeUnit.SECONDS)) return;
@@ -303,10 +374,10 @@ public final class BenchmarkMain {
         return body.remaining();
     }
 
-    private static MessageTimes messageTimes(MessageView message) {
-        long now = System.currentTimeMillis();
-        Long e2e = now - message.getBornTimestamp();
-        Long lag = message.getDeliveryTimestamp().isPresent() ? now - message.getDeliveryTimestamp().get() : null;
+    private static MessageTimes messageTimes(MessageView message, long nowMillis) {
+        Long e2e = MessageTrace.e2eMillis(message, nowMillis);
+        Long lag = message.getDeliveryTimestamp().isPresent()
+            ? nowMillis - message.getDeliveryTimestamp().get() : null;
         return new MessageTimes(e2e, lag);
     }
 
@@ -318,6 +389,20 @@ public final class BenchmarkMain {
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+    }
+
+    private static final class BuiltMessage {
+        final Message message;
+        final String key;
+        final long seq;
+        final long sendTs;
+
+        BuiltMessage(Message message, String key, long seq, long sendTs) {
+            this.message = message;
+            this.key = key;
+            this.seq = seq;
+            this.sendTs = sendTs;
         }
     }
 

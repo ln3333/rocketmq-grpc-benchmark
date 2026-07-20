@@ -15,7 +15,7 @@ final class Options {
     private static final Set<String> COMMON = set(
         "help", "endpoints", "namespace", "ssl", "access-key", "secret-key", "security-token",
         "request-timeout-ms", "max-startup-attempts", "duration-seconds", "warmup-seconds",
-        "report-interval-seconds", "rate", "csv", "topic", "threads");
+        "report-interval-seconds", "rate", "csv", "topic", "threads", "trace-enabled", "journal");
     private static final Set<String> PRODUCER = set(
         "message-size", "topic-type", "send-mode", "max-inflight", "tag", "key-enabled", "property-size",
         "max-attempts", "message-groups", "delay-ms", "commit-percent");
@@ -111,6 +111,7 @@ final class Options {
         positive("threads", command == Command.PRODUCER ? 64 : command == Command.PUSH_CONSUMER ? 20 : 4);
         credentials();
         bool("ssl", true);
+        bool("trace-enabled", true);
 
         if (command == Command.PRODUCER) validateProducer();
         else validateConsumer();
@@ -220,7 +221,9 @@ final class Options {
             + "  --duration-seconds N        Measured duration; 0 runs until signal (default: 0)\n"
             + "  --report-interval-seconds N Report interval (default: 10)\n"
             + "  --rate N                    Global messages/second limit; 0 is unlimited\n"
-            + "  --csv PATH                  Write interval snapshots to CSV\n";
+            + "  --csv PATH                  Write interval snapshots to CSV\n"
+            + "  --trace-enabled true|false  Embed messageKey/seq/sendTs; consumer tracks local dups (default: true)\n"
+            + "  --journal PATH              Append per-message sent/recv/done evidence for offline checks\n";
         if (command == Command.PRODUCER) {
             return "Usage: producer.sh [options]\n" + common
                 + "Producer:\n"
@@ -229,7 +232,7 @@ final class Options {
                 + "  --send-mode MODE           sync|async (default: sync; tx is sync only)\n"
                 + "  --max-inflight N           Async request limit (default: 1024)\n"
                 + "  --tag TAG                  Optional message tag\n"
-                + "  --key-enabled              Generate a unique key per message\n"
+                + "  --key-enabled              Generate a unique key per message when --trace-enabled false\n"
                 + "  --property-size N          Benchmark property bytes (default: 0)\n"
                 + "  --max-attempts N           SDK send attempts (default: 3)\n"
                 + "  --message-groups N         FIFO group count (default: 64)\n"

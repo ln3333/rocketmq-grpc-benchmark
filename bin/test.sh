@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 mvn -f "$ROOT/pom.xml" -DskipTests clean package
-java -ea -cp "$ROOT/target/test-classes:$ROOT/target/classes" \
+java -ea -cp "$ROOT/target/test-classes:$ROOT/target/rocketmq-grpc-benchmark-all.jar" \
   org.apache.rocketmq.grpc.benchmark.BenchmarkSelfTest
 
 for script in producer push-consumer simple-consumer; do
