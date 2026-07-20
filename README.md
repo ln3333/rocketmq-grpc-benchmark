@@ -109,3 +109,21 @@ bin/producer.sh --help
 bin/push-consumer.sh --help
 bin/simple-consumer.sh --help
 ```
+
+## Docker
+
+```bash
+docker build -t rocketmq-grpc-benchmark .
+
+docker run --rm rocketmq-grpc-benchmark producer \
+  --endpoints host.docker.internal:8081 --ssl false \
+  --topic benchmark-normal --duration-seconds 60
+
+docker run --rm rocketmq-grpc-benchmark push-consumer \
+  --endpoints host.docker.internal:8081 --ssl false \
+  --topic benchmark-normal --consumer-group benchmark-push
+```
+
+Linux 上连接宿主机 Proxy 时，可使用宿主机实际地址或添加
+`--add-host host.docker.internal:host-gateway`。ACL 参数建议通过 `-e ROCKETMQ_ACCESS_KEY=...`
+等环境变量传入。镜像默认以非 root 用户运行。
